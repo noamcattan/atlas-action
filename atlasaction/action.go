@@ -13,16 +13,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/go-git/go-git/v5"
-	gitconfig "github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	"io"
-	"log"
 	"net/url"
 	"os"
-	"path"
-	filepath "path/filepath"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -73,8 +68,8 @@ type (
 		CommentLint(context.Context, *TriggerContext, *atlasexec.SummaryReport) error
 		// CommentPlan comments on the pull request with the schema plan.
 		CommentPlan(context.Context, *TriggerContext, *atlasexec.SchemaPlan) error
-		// IsCoAuthored checks if the given commit is co-authored by a bot.
-		IsCoAuthored(ctx context.Context, commit string) (bool, error)
+		// IsCoAuthored determines if the given trigger is the result of a code-suggestion commit.
+		IsCoAuthored(context.Context, *TriggerContext) (bool, error)
 	}
 	Logger interface {
 		// Infof logs an info message.
@@ -500,13 +495,13 @@ func (a *Actions) MigrateLint(ctx context.Context) error {
 		case err != nil:
 			return err
 		default:
-			dirPath := strings.TrimPrefix(dirURL, "file://")
 			a.Infof("SCM client exists. checking if commit is co-authored")
-			coAuthored, err := scm.IsCoAuthored(ctx, tc.PullRequest.Commit)
+			coAuthored, err := scm.IsCoAuthored(ctx, tc)
 			if err != nil {
 				return err
 			}
 			if !coAuthored {
+				a.Infof("not co-authored")
 				break
 			}
 			a.Infof("commit is co-authored. running migrate hash")
@@ -518,79 +513,55 @@ func (a *Actions) MigrateLint(ctx context.Context) error {
 			}); err != nil {
 				return err
 			}
-			p, err := filepath.Abs(".")
-			if err != nil {
+			var (
+				dirPath = strings.TrimPrefix(dirURL, "file://")
+				stdout  bytes.Buffer
+				cmd     = exec.CommandContext(ctx, "git", "diff", dirPath)
+			)
+			cmd.Stdout = &stdout
+			if err := cmd.Run(); err != nil {
 				return err
 			}
-			a.Infof("opening repo at %s", p)
-			r, err := git.PlainOpen(p)
-			if err != nil {
-				return err
-			}
-			w, err := r.Worktree()
-			if err != nil {
-				return err
-			}
-			a.Infof("checking out branch %s", plumbing.NewBranchReferenceName(tc.Branch))
-			if err := w.Checkout(&git.CheckoutOptions{
-				Branch: plumbing.NewBranchReferenceName(tc.Branch),
-				Create: true,
-				Keep:   true,
-			}); err != nil {
-				return err
-			}
-			status, err := w.Status()
-			if err != nil {
-				return err
-			}
-			a.Infof("git status: %s", status.String())
-			if f := status.File(path.Join(dirPath, "atlas.sum")); f == nil || f.Worktree != git.Modified {
+			if stdout.Len() == 0 {
+				// No changes were made, skip commiting.
 				break
 			}
-			a.Infof("staging file")
-			if _, err := w.Add(path.Join(dirPath, "atlas.sum")); err != nil {
-				return err
-			}
-			status, err = w.Status()
+			u, err := url.Parse(tc.RepoURL + ".git")
 			if err != nil {
 				return err
 			}
-			a.Infof("git status: %s", status.String())
-			a.Infof("setting git config")
-			conf, err := r.Config()
-			if err != nil {
+			u.User = url.UserPassword("x-access-token", a.Getenv("GITHUB_TOKEN"))
+			a.Infof(u.String())
+			if err := exec.CommandContext(ctx, "git", "remote", "set-url", "origin", u.String()).Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "remote", "set-url", "origin", u)`)
 				return err
 			}
-			conf.Author.Name = "Atlas Action"
-			conf.Author.Email = "github-action@atlasgo.cloud"
-			if err := r.SetConfig(conf); err != nil {
+			//if err := exec.CommandContext(ctx, "git", "fetch").Run(); err != nil {
+			//	a.Infof(`exec.CommandContext(ctx, "git", "fetch")`)
+			//	return err
+			//}
+			//if err := exec.CommandContext(ctx, "git", "checkout", tc.Branch).Run(); err != nil {
+			//	a.Infof(`exec.CommandContext(ctx, "git", "checkout", "-b", tc.Branch)`)
+			//	return err
+			//}
+			if err := exec.CommandContext(ctx, "git", "add", dirPath).Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "add", dirPath)`)
 				return err
 			}
-			a.Infof("committing changes")
-			if _, err := w.Commit("update sum file", &git.CommitOptions{}); err != nil {
+			if err := exec.CommandContext(ctx, "git", "config", "--global", "user.name", "github-actions[bot]").Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "config", "--global", "user.name", "github-actions[bot]")`)
 				return err
 			}
-			status, err = w.Status()
-			if err != nil {
+			if err := exec.CommandContext(ctx, "git", "config", "--global", "user.email", "github-actions[bot]@users.noreply.github.com").Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "config", "--global", "user.email", "github-actions[bot]@users.noreply.github.com")`)
 				return err
 			}
-			a.Infof("git status: %s", status.String())
-			headRef, err := r.Head()
-			if err != nil {
-				log.Fatalf("Failed to get HEAD reference: %v", err)
+			if err := exec.CommandContext(ctx, "git", "commit", "-m", fmt.Sprintf("update %s", filepath.Join(dirPath, "atlas.sum"))).Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "commit", "-m", fmt.Sprintf("update %s", filepath.Join(dirPath, "atlas.sum")))`)
+				return err
 			}
-			log.Printf("Current branch: %s\n", headRef.Name().Short())
-			remotes, _ := r.Remotes()
-			for _, remote := range remotes {
-				log.Println("Remote:", remote.Config().URLs)
-			}
-			a.Infof("pushing changes")
-			auth := &http.BasicAuth{Username: "Atlas Action", Password: tc.Act.Getenv("GITHUB_TOKEN")}
-			if err := r.PushContext(ctx, &git.PushOptions{
-				RemoteName: "origin",
-				RefSpecs:   []gitconfig.RefSpec{gitconfig.RefSpec(fmt.Sprintf("+%s:%s", plumbing.NewBranchReferenceName(tc.Branch), plumbing.NewBranchReferenceName(tc.Branch)))},
-				Auth:       auth,
-				Force:      true}); err != nil {
+			if err := exec.CommandContext(ctx, "git", "push", "-u", "origin", "HEAD:"+tc.Branch).Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "push", "-u", "origin", "HEAD")`)
 				return err
 			}
 		}
