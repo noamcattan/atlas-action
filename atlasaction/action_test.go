@@ -327,6 +327,11 @@ func (m *mockAtlas) MigrateLintError(context.Context, *atlasexec.MigrateLintPara
 	panic("unimplemented")
 }
 
+// MigrateHash implements AtlasExec.
+func (m *mockAtlas) MigrateHash(context.Context, *atlasexec.MigrateHashParams) error {
+	panic("unimplemented")
+}
+
 // MigratePush implements AtlasExec.
 func (m *mockAtlas) MigratePush(context.Context, *atlasexec.MigratePushParams) (string, error) {
 	panic("unimplemented")

@@ -16,6 +16,8 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -66,6 +68,8 @@ type (
 		CommentLint(context.Context, *TriggerContext, *atlasexec.SummaryReport) error
 		// CommentPlan comments on the pull request with the schema plan.
 		CommentPlan(context.Context, *TriggerContext, *atlasexec.SchemaPlan) error
+		// IsCoAuthored determines if the given trigger is the result of a code-suggestion commit.
+		IsCoAuthored(context.Context, *TriggerContext) (bool, error)
 	}
 	Logger interface {
 		// Infof logs an info message.
@@ -92,6 +96,8 @@ type (
 		MigrateDown(context.Context, *atlasexec.MigrateDownParams) (*atlasexec.MigrateDown, error)
 		// MigrateLintError runs the `migrate lint` command and fails if there are lint errors.
 		MigrateLintError(context.Context, *atlasexec.MigrateLintParams) error
+		// MigrateHash runs the `migrate lint` command and fails if there are lint errors.
+		MigrateHash(context.Context, *atlasexec.MigrateHashParams) error
 		// MigratePush runs the `migrate push` command.
 		MigratePush(context.Context, *atlasexec.MigratePushParams) (string, error)
 		// MigrateTest runs the `migrate test` command.
@@ -475,9 +481,90 @@ func (a *Actions) MigrateLint(ctx context.Context) error {
 	if dirName == "" {
 		return errors.New("atlasaction: missing required parameter dir-name")
 	}
+	dirURL := a.GetInput("dir")
 	tc, err := a.GetTriggerContext(ctx)
 	if err != nil {
 		return err
+	}
+	a.Infof("Branch: %s", tc.Branch)
+	if a.GetBoolInput("auto-hash") && tc.PullRequest != nil && strings.HasPrefix(dirURL, "file://") {
+		a.Infof("Checking if scm client exists")
+		scm, err := tc.SCMClient()
+		switch {
+		case errors.Is(err, ErrNoSCM):
+		case err != nil:
+			return err
+		default:
+			a.Infof("SCM client exists. checking if commit is co-authored")
+			coAuthored, err := scm.IsCoAuthored(ctx, tc)
+			if err != nil {
+				return err
+			}
+			if !coAuthored {
+				a.Infof("not co-authored")
+				break
+			}
+			a.Infof("commit is co-authored. running migrate hash")
+			if err := a.Atlas.MigrateHash(ctx, &atlasexec.MigrateHashParams{
+				DirURL:    dirURL,
+				ConfigURL: a.GetInput("config"),
+				Env:       a.GetInput("env"),
+				Vars:      a.GetVarsInput("vars"),
+			}); err != nil {
+				return err
+			}
+			var (
+				dirPath = strings.TrimPrefix(dirURL, "file://")
+				stdout  bytes.Buffer
+				cmd     = exec.CommandContext(ctx, "git", "diff", dirPath)
+			)
+			cmd.Stdout = &stdout
+			if err := cmd.Run(); err != nil {
+				return err
+			}
+			if stdout.Len() == 0 {
+				// No changes were made, skip commiting.
+				break
+			}
+			u, err := url.Parse(tc.RepoURL + ".git")
+			if err != nil {
+				return err
+			}
+			u.User = url.UserPassword("x-access-token", a.Getenv("GITHUB_TOKEN"))
+			a.Infof(u.String())
+			if err := exec.CommandContext(ctx, "git", "remote", "set-url", "origin", u.String()).Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "remote", "set-url", "origin", u)`)
+				return err
+			}
+			//if err := exec.CommandContext(ctx, "git", "fetch").Run(); err != nil {
+			//	a.Infof(`exec.CommandContext(ctx, "git", "fetch")`)
+			//	return err
+			//}
+			//if err := exec.CommandContext(ctx, "git", "checkout", tc.Branch).Run(); err != nil {
+			//	a.Infof(`exec.CommandContext(ctx, "git", "checkout", "-b", tc.Branch)`)
+			//	return err
+			//}
+			if err := exec.CommandContext(ctx, "git", "add", dirPath).Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "add", dirPath)`)
+				return err
+			}
+			if err := exec.CommandContext(ctx, "git", "config", "--global", "user.name", "github-actions[bot]").Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "config", "--global", "user.name", "github-actions[bot]")`)
+				return err
+			}
+			if err := exec.CommandContext(ctx, "git", "config", "--global", "user.email", "github-actions[bot]@users.noreply.github.com").Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "config", "--global", "user.email", "github-actions[bot]@users.noreply.github.com")`)
+				return err
+			}
+			if err := exec.CommandContext(ctx, "git", "commit", "-m", fmt.Sprintf("update %s", filepath.Join(dirPath, "atlas.sum"))).Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "commit", "-m", fmt.Sprintf("update %s", filepath.Join(dirPath, "atlas.sum")))`)
+				return err
+			}
+			if err := exec.CommandContext(ctx, "git", "push", "-u", "origin", "HEAD:"+tc.Branch).Run(); err != nil {
+				a.Infof(`exec.CommandContext(ctx, "git", "push", "-u", "origin", "HEAD")`)
+				return err
+			}
+		}
 	}
 	var (
 		resp      bytes.Buffer
@@ -488,7 +575,7 @@ func (a *Actions) MigrateLint(ctx context.Context) error {
 	switch err := a.Atlas.MigrateLintError(ctx, &atlasexec.MigrateLintParams{
 		Context:   rc,
 		DevURL:    a.GetInput("dev-url"),
-		DirURL:    a.GetInput("dir"),
+		DirURL:    dirURL,
 		ConfigURL: a.GetInput("config"),
 		Env:       a.GetInput("env"),
 		Base:      a.GetAtlasURLInput("dir-name", "tag"),
